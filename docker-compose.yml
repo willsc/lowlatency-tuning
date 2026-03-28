@@ -1,0 +1,676 @@
+# =============================================================================
+# Production-Grade CI/CD Stack
+# TeamCity + GitLab + Octopus Deploy + Prometheus + Grafana + ClickHouse
+# =============================================================================
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+    tag: "{{.Name}}"
+
+x-healthcheck-defaults: &healthcheck-defaults
+  interval: 30s
+  timeout: 10s
+  retries: 5
+  start_period: 60s
+
+services:
+  # ===========================================================================
+  # GitLab
+  # ===========================================================================
+  gitlab:
+    image: gitlab/gitlab-ce:17.6.2-ce.0
+    container_name: gitlab
+    hostname: ${GITLAB_HOSTNAME}
+    restart: ${DOCKER_RESTART_POLICY}
+    logging: *default-logging
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'http://${GITLAB_HOSTNAME}:${GITLAB_HTTP_PORT}'
+        gitlab_rails['initial_root_password'] = '${GITLAB_ROOT_PASSWORD}'
+        gitlab_rails['gitlab_shell_ssh_port'] = ${GITLAB_SSH_PORT}
+
+        # Database
+        postgresql['enable'] = false
+        gitlab_rails['db_adapter'] = 'postgresql'
+        gitlab_rails['db_encoding'] = 'unicode'
+        gitlab_rails['db_host'] = 'postgres'
+        gitlab_rails['db_port'] = 5432
+        gitlab_rails['db_database'] = '${GITLAB_DB_NAME}'
+        gitlab_rails['db_username'] = '${GITLAB_DB_USER}'
+        gitlab_rails['db_password'] = '${GITLAB_DB_PASSWORD}'
+
+        # Redis
+        redis['enable'] = false
+        gitlab_rails['redis_host'] = 'redis'
+        gitlab_rails['redis_port'] = 6379
+
+        # Prometheus node exporter
+        node_exporter['enable'] = true
+        node_exporter['listen_address'] = '0.0.0.0:9100'
+
+        # Monitoring
+        gitlab_rails['monitoring_whitelist'] = ['0.0.0.0/0']
+        gitlab_rails['prometheus_address'] = 'prometheus:9090'
+
+        # Performance tuning
+        puma['worker_processes'] = 2
+        sidekiq['max_concurrency'] = 10
+        prometheus_monitoring['enable'] = false
+    ports:
+      - "${GITLAB_HTTP_PORT}:${GITLAB_HTTP_PORT}"
+      - "${GITLAB_SSH_PORT}:22"
+    volumes:
+      - gitlab_config:/etc/gitlab
+      - gitlab_logs:/var/log/gitlab
+      - gitlab_data:/var/opt/gitlab
+    networks:
+      - cicd
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD", "gitlab-healthcheck", "--fail", "--max-time", "10"]
+      start_period: 300s
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 6G
+        reservations:
+          cpus: "2.0"
+          memory: 4G
+    shm_size: 256m
+
+  # ===========================================================================
+  # Redis (GitLab dependency)
+  # ===========================================================================
+  redis:
+    image: redis:7.4-alpine
+    container_name: redis
+    restart: ${DOCKER_RESTART_POLICY}
+    logging: *default-logging
+    command: >
+      redis-server
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --save 60 1000
+      --loglevel warning
+    volumes:
+      - redis_data:/data
+    networks:
+      - backend
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD", "redis-cli", "ping"]
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768M
+        reservations:
+          memory: 256M
+
+  # ===========================================================================
+  # PostgreSQL (GitLab + TeamCity)
+  # ===========================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    restart: ${DOCKER_RESTART_POLICY}
+    logging: *default-logging
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-postgres.sh:/docker-entrypoint-initdb.d/init-postgres.sh:ro
+    networks:
+      - backend
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    command: >
+      postgres
+      -c shared_buffers=512MB
+      -c effective_cache_size=1536MB
+      -c maintenance_work_mem=128MB
+      -c work_mem=16MB
+      -c max_connections=200
+      -c wal_buffers=16MB
+      -c checkpoint_completion_target=0.9
+      -c random_page_cost=1.1
+      -c log_min_duration_statement=1000
+
+  # ===========================================================================
+  # TeamCity Server
+  # ===========================================================================
+  teamcity-server:
+    image: jetbrains/teamcity-server:2024.12.1
+    container_name: teamcity-server
+    restart: ${DOCKER_RESTART_POLICY}
+    logging: *default-logging
+    environment:
+      TEAMCITY_SERVER_MEM_OPTS: ${TEAMCITY_SERVER_MEM_OPTS}
+      TEAMCITY_SERVER_OPTS: >-
+        -Dteamcity.git.fetch.separate.process=true
+    ports:
+      - "${TEAMCITY_SERVER_PORT}:8111"
+    volumes:
+      - teamcity_data:/data/teamcity_server/datadir
+      - teamcity_logs:/opt/teamcity/logs
+    networks:
+      - cicd
+      - backend
+      - monitoring
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "curl -sf http://localhost:8111/healthCheck/healthy || exit 1"]
+      start_period: 180s
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 4G
+        reservations:
+          cpus: "1.0"
+          memory: 2G
+
+  # ===========================================================================
+  # TeamCity Agents (3 runners)
+  # ===========================================================================
+  teamcity-agent-1:
+    image: jetbrains/teamcity-agent:2024.12.1-linux-sudo
+    container_name: teamcity-agent-1
+    restart: ${DOCKER_RESTART_POLICY}
+    logging: *default-logging
+    privileged: true
+    environment:
+      SERVER_URL: http://teamcity-server:8111
+      DOCKER_IN_DOCKER: start
+      AGENT_NAME: agent-1
+    volumes:
+      - teamcity_agent1_conf:/data/teamcity_agent/conf
+      - teamcity_agent1_work:/opt/buildagent/work
+      - teamcity_agent1_temp:/opt/buildagent/temp
+    networks:
+      - cicd
+    depends_on:
+      teamcity-server:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "test -f /opt/buildagent/bin/agent.sh"]
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 1G
+
+  teamcity-agent-2:
+    image: jetbrains/teamcity-agent:2024.12.1-linux-sudo
+    container_name: teamcity-agent-2
+    restart: ${DOCKER_RESTART_POLICY}
+    logging: *default-logging
+    privileged: true
+    environment:
+      SERVER_URL: http://teamcity-server:8111
+      DOCKER_IN_DOCKER: start
+      AGENT_NAME: agent-2
+    volumes:
+      - teamcity_agent2_conf:/data/teamcity_agent/conf
+      - teamcity_agent2_work:/opt/buildagent/work
+      - teamcity_agent2_temp:/opt/buildagent/temp
+    networks:
+      - cicd
+    depends_on:
+      teamcity-server:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "test -f /opt/buildagent/bin/agent.sh"]
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 1G
+
+  teamcity-agent-3:
+    image: jetbrains/teamcity-agent:2024.12.1-linux-sudo
+    container_name: teamcity-agent-3
+    restart: ${DOCKER_RESTART_POLICY}
+    logging: *default-logging
+    privileged: true
+    environment:
+      SERVER_URL: http://teamcity-server:8111
+      DOCKER_IN_DOCKER: start
+      AGENT_NAME: agent-3
+    volumes:
+      - teamcity_agent3_conf:/data/teamcity_agent/conf
+      - teamcity_agent3_work:/opt/buildagent/work
+      - teamcity_agent3_temp:/opt/buildagent/temp
+    networks:
+      - cicd
+    depends_on:
+      teamcity-server:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "test -f /opt/buildagent/bin/agent.sh"]
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 1G
+
+  # ===========================================================================
+  # MSSQL (Octopus Deploy dependency)
+  # ===========================================================================
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: mssql
+    restart: ${DOCKER_RESTART_POLICY}
+    logging: *default-logging
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}
+      MSSQL_PID: ${MSSQL_PID}
+    volumes:
+      - mssql_data:/var/opt/mssql
+    networks:
+      - backend
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"${MSSQL_SA_PASSWORD}\" -C -Q 'SELECT 1' -b -o /dev/null"]
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 1G
+
+  # ===========================================================================
+  # Octopus Deploy
+  # ===========================================================================
+  octopus-deploy:
+    image: octopusdeploy/octopusdeploy:2024.4
+    container_name: octopus-deploy
+    restart: ${DOCKER_RESTART_POLICY}
+    logging: *default-logging
+    environment:
+      ACCEPT_EULA: "Y"
+      ADMIN_USERNAME: ${OCTOPUS_ADMIN_USERNAME}
+      ADMIN_PASSWORD: ${OCTOPUS_ADMIN_PASSWORD}
+      DB_CONNECTION_STRING: ${OCTOPUS_DB_CONNECTION_STRING}
+      MASTER_KEY: ${OCTOPUS_MASTER_KEY}
+      CONNSTRING: ${OCTOPUS_DB_CONNECTION_STRING}
+      DISABLE_DIND: "Y"
+    ports:
+      - "${OCTOPUS_SERVER_PORT}:8080"
+    volumes:
+      - octopus_data:/repository
+      - octopus_artifacts:/artifacts
+      - octopus_taskLogs:/taskLogs
+      - octopus_cache:/cache
+      - octopus_import:/import
+    networks:
+      - cicd
+      - backend
+      - monitoring
+    depends_on:
+      mssql:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/api || exit 1"]
+      start_period: 180s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+        reservations:
+          cpus: "1.0"
+          memory: 2G
+
+  # ===========================================================================
+  # ClickHouse
+  # ===========================================================================
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.11-alpine
+    container_name: clickhouse
+    restart: ${DOCKER_RESTART_POLICY}
+    logging: *default-logging
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "${CLICKHOUSE_HTTP_PORT}:8123"
+      - "${CLICKHOUSE_NATIVE_PORT}:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+      - ./configs/clickhouse/config.xml:/etc/clickhouse-server/config.d/custom.xml:ro
+      - ./configs/clickhouse/users.xml:/etc/clickhouse-server/users.d/custom.xml:ro
+    networks:
+      - monitoring
+      - backend
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:8123/ping || exit 1"]
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 4G
+        reservations:
+          cpus: "1.0"
+          memory: 2G
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  # ===========================================================================
+  # Tabix (ClickHouse Web UI)
+  # ===========================================================================
+  tabix:
+    image: spoonest/clickhouse-tabix-web-client:stable
+    container_name: tabix
+    restart: ${DOCKER_RESTART_POLICY}
+    logging: *default-logging
+    ports:
+      - "${TABIX_PORT:-8124}:80"
+    networks:
+      - monitoring
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
+
+  # ===========================================================================
+  # Prometheus
+  # ===========================================================================
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: prometheus
+    restart: ${DOCKER_RESTART_POLICY}
+    logging: *default-logging
+    user: root
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=${PROMETHEUS_RETENTION}"
+      - "--storage.tsdb.retention.size=${PROMETHEUS_RETENTION_SIZE}"
+      - "--web.enable-lifecycle"
+      - "--web.enable-admin-api"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+    ports:
+      - "${PROMETHEUS_PORT}:9090"
+    volumes:
+      - ./configs/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./configs/prometheus/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - monitoring
+      - cicd
+      - backend
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9090/-/healthy || exit 1"]
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+
+  # ===========================================================================
+  # Grafana
+  # ===========================================================================
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: grafana
+    restart: ${DOCKER_RESTART_POLICY}
+    logging: *default-logging
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_INSTALL_PLUGINS: ${GF_INSTALL_PLUGINS}
+      GF_SERVER_ROOT_URL: "http://localhost:${GRAFANA_PORT}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_USERS_ALLOW_ORG_CREATE: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SECURITY_COOKIE_SECURE: "false"
+      GF_SECURITY_STRICT_TRANSPORT_SECURITY: "true"
+      GF_LOG_LEVEL: warn
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+    ports:
+      - "${GRAFANA_PORT}:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./configs/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./configs/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+    networks:
+      - monitoring
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1"]
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  # ===========================================================================
+  # Node Exporter (host metrics for Prometheus)
+  # ===========================================================================
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: node-exporter
+    restart: ${DOCKER_RESTART_POLICY}
+    logging: *default-logging
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.rootfs=/rootfs"
+      - "--path.sysfs=/host/sys"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    networks:
+      - monitoring
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9100/metrics || exit 1"]
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+
+  # ===========================================================================
+  # cAdvisor (container metrics for Prometheus)
+  # ===========================================================================
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.51.0
+    container_name: cadvisor
+    restart: ${DOCKER_RESTART_POLICY}
+    logging: *default-logging
+    privileged: true
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    networks:
+      - monitoring
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8080/healthz || exit 1"]
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  cicd:
+    name: cicd-network
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+  backend:
+    name: backend-network
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16
+  monitoring:
+    name: monitoring-network
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  # GitLab
+  gitlab_config:
+    name: gitlab_config
+  gitlab_logs:
+    name: gitlab_logs
+  gitlab_data:
+    name: gitlab_data
+
+  # Redis
+  redis_data:
+    name: redis_data
+
+  # PostgreSQL
+  postgres_data:
+    name: postgres_data
+
+  # TeamCity
+  teamcity_data:
+    name: teamcity_data
+  teamcity_logs:
+    name: teamcity_logs
+  teamcity_agent1_conf:
+    name: teamcity_agent1_conf
+  teamcity_agent1_work:
+    name: teamcity_agent1_work
+  teamcity_agent1_temp:
+    name: teamcity_agent1_temp
+  teamcity_agent2_conf:
+    name: teamcity_agent2_conf
+  teamcity_agent2_work:
+    name: teamcity_agent2_work
+  teamcity_agent2_temp:
+    name: teamcity_agent2_temp
+  teamcity_agent3_conf:
+    name: teamcity_agent3_conf
+  teamcity_agent3_work:
+    name: teamcity_agent3_work
+  teamcity_agent3_temp:
+    name: teamcity_agent3_temp
+
+  # MSSQL
+  mssql_data:
+    name: mssql_data
+
+  # Octopus Deploy
+  octopus_data:
+    name: octopus_data
+  octopus_artifacts:
+    name: octopus_artifacts
+  octopus_taskLogs:
+    name: octopus_taskLogs
+  octopus_cache:
+    name: octopus_cache
+  octopus_import:
+    name: octopus_import
+
+  # ClickHouse
+  clickhouse_data:
+    name: clickhouse_data
+  clickhouse_logs:
+    name: clickhouse_logs
+
+  # Prometheus
+  prometheus_data:
+    name: prometheus_data
+
+  # Grafana
+  grafana_data:
+    name: grafana_data

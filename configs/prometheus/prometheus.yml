@@ -1,0 +1,104 @@
+# =============================================================================
+# Prometheus Configuration
+# =============================================================================
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+  external_labels:
+    cluster: cicd-stack
+    environment: production
+
+rule_files:
+  - "alert_rules.yml"
+
+scrape_configs:
+  # ---------------------------------------------------------------------------
+  # Prometheus self-monitoring
+  # ---------------------------------------------------------------------------
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+        labels:
+          service: prometheus
+
+  # ---------------------------------------------------------------------------
+  # Node Exporter (host metrics)
+  # ---------------------------------------------------------------------------
+  - job_name: "node-exporter"
+    static_configs:
+      - targets: ["node-exporter:9100"]
+        labels:
+          service: node-exporter
+
+  # ---------------------------------------------------------------------------
+  # cAdvisor (container metrics)
+  # ---------------------------------------------------------------------------
+  - job_name: "cadvisor"
+    static_configs:
+      - targets: ["cadvisor:8080"]
+        labels:
+          service: cadvisor
+
+  # ---------------------------------------------------------------------------
+  # GitLab
+  # ---------------------------------------------------------------------------
+  - job_name: "gitlab"
+    metrics_path: "/-/metrics"
+    static_configs:
+      - targets: ["gitlab:8929"]
+        labels:
+          service: gitlab
+
+  - job_name: "gitlab-node"
+    static_configs:
+      - targets: ["gitlab:9100"]
+        labels:
+          service: gitlab-node
+
+  # ---------------------------------------------------------------------------
+  # TeamCity Server
+  # ---------------------------------------------------------------------------
+  - job_name: "teamcity"
+    metrics_path: "/app/metrics"
+    static_configs:
+      - targets: ["teamcity-server:8111"]
+        labels:
+          service: teamcity-server
+
+  # ---------------------------------------------------------------------------
+  # ClickHouse
+  # ---------------------------------------------------------------------------
+  - job_name: "clickhouse"
+    static_configs:
+      - targets: ["clickhouse:9363"]
+        labels:
+          service: clickhouse
+
+  # ---------------------------------------------------------------------------
+  # Grafana
+  # ---------------------------------------------------------------------------
+  - job_name: "grafana"
+    static_configs:
+      - targets: ["grafana:3000"]
+        labels:
+          service: grafana
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL (via pg_stat metrics if exporter added)
+  # ---------------------------------------------------------------------------
+  - job_name: "postgres"
+    static_configs:
+      - targets: ["postgres:9187"]
+        labels:
+          service: postgres
+
+  # ---------------------------------------------------------------------------
+  # Redis
+  # ---------------------------------------------------------------------------
+  - job_name: "redis"
+    static_configs:
+      - targets: ["redis:9121"]
+        labels:
+          service: redis

@@ -1,0 +1,55 @@
+<!-- ======================================================================= -->
+<!-- ClickHouse Server Custom Configuration                                  -->
+<!-- ======================================================================= -->
+<clickhouse>
+    <!-- Force IPv4 only (IPv6 disabled on host) -->
+    <listen_host>0.0.0.0</listen_host>
+
+    <!-- Logging -->
+    <logger>
+        <level>warning</level>
+        <log>/var/log/clickhouse-server/clickhouse-server.log</log>
+        <errorlog>/var/log/clickhouse-server/clickhouse-server.err.log</errorlog>
+        <size>100M</size>
+        <count>5</count>
+    </logger>
+
+    <!-- Performance -->
+    <max_connections>256</max_connections>
+    <max_concurrent_queries>100</max_concurrent_queries>
+    <max_server_memory_usage_to_ram_ratio>0.8</max_server_memory_usage_to_ram_ratio>
+
+    <!-- Prometheus metrics endpoint -->
+    <prometheus>
+        <endpoint>/metrics</endpoint>
+        <port>9363</port>
+        <metrics>true</metrics>
+        <events>true</events>
+        <asynchronous_metrics>true</asynchronous_metrics>
+        <status_info>true</status_info>
+    </prometheus>
+
+    <!-- MergeTree settings -->
+    <merge_tree>
+        <max_suspicious_broken_parts>5</max_suspicious_broken_parts>
+        <parts_to_delay_insert>150</parts_to_delay_insert>
+        <parts_to_throw_insert>300</parts_to_throw_insert>
+        <max_delay_to_insert>1</max_delay_to_insert>
+    </merge_tree>
+
+    <!-- Query log (stored in ClickHouse itself) -->
+    <query_log>
+        <database>system</database>
+        <table>query_log</table>
+        <partition_by>toYYYYMM(event_date)</partition_by>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+    </query_log>
+
+    <!-- Metric log -->
+    <metric_log>
+        <database>system</database>
+        <table>metric_log</table>
+        <collect_interval_milliseconds>1000</collect_interval_milliseconds>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+    </metric_log>
+</clickhouse>

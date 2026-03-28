@@ -1,0 +1,49 @@
+# =============================================================================
+# Grafana Datasource Provisioning
+# =============================================================================
+
+apiVersion: 1
+
+deleteDatasources:
+  - name: Prometheus
+    orgId: 1
+  - name: ClickHouse
+    orgId: 1
+
+datasources:
+  # ---------------------------------------------------------------------------
+  # Prometheus
+  # ---------------------------------------------------------------------------
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    orgId: 1
+    uid: prometheus
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: POST
+      timeInterval: "15s"
+      exemplarTraceIdDestinations:
+        - name: traceID
+          datasourceUid: prometheus
+
+  # ---------------------------------------------------------------------------
+  # ClickHouse
+  # ---------------------------------------------------------------------------
+  - name: ClickHouse
+    type: grafana-clickhouse-datasource
+    access: proxy
+    orgId: 1
+    uid: clickhouse
+    editable: false
+    jsonData:
+      host: clickhouse
+      port: 9000
+      protocol: native
+      secure: false
+      username: admin
+      defaultDatabase: default
+    secureJsonData:
+      password: ${CLICKHOUSE_PASSWORD}
